@@ -1,0 +1,267 @@
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+from xml.dom.minidom import parseString
+
+import UniFlash.miscellaneous as miscellaneous
+
+_ = miscellaneous.i18n
+
+#: Disable message coloring when set to True, set by --no-color
+no_color = False
+
+# External tools
+try:
+    import termcolor
+except ImportError:
+    print("Module termcolor is not installed, text coloring disabled")
+    no_color = True
+
+gui = None
+verbose = False
+
+
+def check_runtime_dependencies(application_name):
+    """
+    Check required runtime dependencies for Windows.
+    :param application_name: The application name (UniFlash).
+    :return: List of commands used in the application (mkdosfs, mkntfs, etc.)
+    """
+    result = "success"
+
+    # For Windows, we use diskpart, PowerShell commands, and third-party utilities if needed
+    system_commands = ["diskpart", "PowerShell"]
+    
+    for command in system_commands:
+        if shutil.which(command) is None:
+            print_with_color(
+                _("Error: {0} requires {1} command in the executable search path, but it is not found.").format(
+                    application_name, command),
+                "red")
+            result = "failed"
+
+    fat = "diskpart"
+    ntfs = "diskpart"
+    grub = None  # No grub in Windows; GRUB is typically not used here
+
+    if result != "success":
+        raise RuntimeError("Dependencies are not met")
+    else:
+        return [fat, ntfs, grub]
+
+
+def check_runtime_parameters(install_mode, source_media, target_media):
+    """
+    :param install_mode:
+    :param source_media:
+    :param target_media:
+    :return:
+    """
+    if not os.path.isfile(source_media):
+        print_with_color(
+            _("Error: Source media \"{0}\" not found or not a regular file!").format(source_media), "red")
+        return 1
+
+    # For Windows, use drive letter checks instead of block devices
+    if not re.match(r"^[A-Z]:\\", target_media):
+        print_with_color(_("Error: Target media \"{0}\" is not a valid drive letter!").format(target_media), "red")
+        return 1
+
+    if install_mode == "device" and not re.match(r"^[A-Z]:$", target_media):
+        print_with_color(_("Error: Target media \"{0}\" is not an entire storage device!").format(target_media), "red")
+        return 1
+
+    if install_mode == "partition" and not re.match(r"^[A-Z]:\\", target_media):
+        print_with_color(_("Error: Target media \"{0}\" is not a partition!").format(target_media), "red")
+        return 1
+    return 0
+
+
+def determine_target_parameters(install_mode, target_media):
+    """
+    :param install_mode:
+    :param target_media:
+    :return:
+    """
+    if install_mode == "partition":
+        target_partition = target_media
+        target_device = target_media  # In Windows, the device and partition are both identified by drive letters
+    else:
+        target_device = target_media
+        target_partition = target_media  # No separate partition identifier needed in Windows
+
+    if verbose:
+        print_with_color(_("Info: Target device is {0}").format(target_device))
+        print_with_color(_("Info: Target partition is {0}").format(target_partition))
+
+    return [target_device, target_partition]
+
+
+def check_is_target_device_busy(device):
+    """
+    :param device: The target drive letter (e.g., 'D:').
+    :return: 0 if not busy, 1 if busy.
+    """
+    # Use diskpart or PowerShell to check if the device is busy
+    powershell_command = f"Get-Volume -DriveLetter {device[0]} | Select-Object DriveLetter, FileSystem"
+    result = subprocess.run(["PowerShell", powershell_command], stdout=subprocess.PIPE).stdout.decode("utf-8")
+
+    if re.search(rf"{device}", result):
+        print_with_color(_("Warning: The drive {0} is currently busy. Please unmount the drive before proceeding.").format(device), "yellow")
+        return 1
+    return 0
+
+
+def check_source_and_target_not_busy(install_mode, source_media, target_device, target_partition):
+    """
+    :param install_mode:
+    :param source_media:
+    :param target_device:
+    :param target_partition:
+    :return:
+    """
+    if check_is_target_device_busy(source_media):
+        print_with_color(_("Error: Source media is currently in use, unmount the drive and try again"), "red")
+        return 1
+
+    if install_mode == "partition":
+        if check_is_target_device_busy(target_partition):
+            print_with_color(_("Error: Target partition is currently mounted, unmount it and try again"), "red")
+            return 1
+    else:
+        if check_is_target_device_busy(target_device):
+            print_with_color(
+                _("Error: Target device is currently busy, unmount the drive and try again"),
+                "red")
+            return 1
+
+
+def check_fat32_filesize_limitation(source_fs_mountpoint):
+    """
+    :param source_fs_mountpoint:
+    :return: 1 if limitation exceeded, 0 otherwise.
+    """
+    for dirpath, dirnames, filenames in os.walk(source_fs_mountpoint):
+        for file in filenames:
+            path = os.path.join(dirpath, file)
+            if os.path.getsize(path) > (2 ** 32) - 1:  # Max FAT32 file size
+                print_with_color(
+                    _("Warning: File {0} exceeds the FAT32 4GiB limit, switching to NTFS.").format(path),
+                    "yellow")
+                return 1
+    return 0
+
+
+def print_with_color(text, color=""):
+    """
+    Print function
+    This function takes into account no_color flag
+    Also if used by gui, sends information to it, rather than putting it into standard output
+
+    :param text: Text to be printed
+    :param color: Color of the text
+    """
+    if gui is not None:
+        gui.state = text
+        if color == "red":
+            gui.error = text
+            sys.exit()
+    else:
+        if no_color or color == "":
+            sys.stdout.write(text + "\n")
+        else:
+            termcolor.cprint(text, color)
+
+
+# Other functions remain unchanged or slightly adapted for Windows
+# e.g., file size check (get_size), FAT32/NTFS logic, etc.
+
+def convert_to_human_readable_format(num, suffix='B'):
+    for unit in ['', 'Ki', 'Mi', 'Gi']:
+        if abs(num) < 1024.0:
+            return "%3.1f%s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f%s%s" % (num, 'Ti', suffix)
+
+
+def get_size(path):
+    total_size = 0
+    for dirpath, __, filenames in os.walk(path):
+        for file in filenames:
+            path = os.path.join(dirpath, file)
+            total_size += os.path.getsize(path)
+    return total_size
+
+
+def check_kill_signal():
+    if gui is not None:
+        if gui.kill:
+            raise sys.exit()
+
+
+# Remaining functions such as update_policy_to_allow_for_running_gui_as_root would either be skipped on Windows
+# or would need to be adjusted for Windows environment, but are not as critical.
+
+
+
+# noinspection DuplicatedCode
+def update_policy_to_allow_for_running_gui_as_root(path):
+    dom = parseString(
+        "<?xml version=\"1.0\" ?>"
+        "<!DOCTYPE policyconfig  PUBLIC '-//freedesktop//DTD polkit Policy Configuration 1.0//EN'  "
+        "'http://www.freedesktop.org/software/polkit/policyconfig-1.dtd'><!-- \n"
+        "DOC: https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html\n"
+        "--><policyconfig>\n"
+        "	<vendor>The WoeUSB Project</vendor>\n"
+        "	<vendor_url>https://github.com/slacka/WoeUSB</vendor_url>\n"
+        "	<icon_name>woeusbgui-icon</icon_name>\n"
+        "\n"
+        "	<action id=\"com.github.slacka.woeusb.run-gui-using-pkexec\">\n"
+        "		<description>Run `woeusb` as SuperUser</description>\n"
+        "		<description xml:lang=\"zh_TW\">以超級使用者(SuperUser)身份執行 `woeusb`</description>\n"
+        "		<description xml:lang=\"pl_PL\">Uruchom `woeusb` jako root</description>\n"
+        "		\n"
+        "		<message>Authentication is required to run `woeusb` as SuperUser.</message>\n"
+        "		<message xml:lang=\"zh_TW\">以超級使用者(SuperUser)身份執行 `woeusb` 需要通過身份驗證。</message>\n"
+        "		<message xml:lang=\"pl_PL\">Wymagana jest autoryzacja do uruchomienia `woeusb` jako root</message>\n"
+        "		\n"
+        "		<defaults>\n"
+        "			<allow_any>auth_admin</allow_any>\n"
+        "			<allow_inactive>auth_admin</allow_inactive>\n"
+        "			<allow_active>auth_admin_keep</allow_active>\n"
+        "		</defaults>\n"
+        "		\n"
+        "		<annotate key=\"org.freedesktop.policykit.exec.path\">/usr/local/bin/woeusbgui</annotate>\n"
+        "   		<annotate key=\"org.freedesktop.policykit.exec.allow_gui\">true</annotate>\n"
+        "	</action>\n"
+        "	<action id=\"com.github.slacka.woeusb.run-gui-using-pkexec-local\">\n"
+        "		<description>Run `woeusb` as SuperUser</description>\n"
+        "		<description xml:lang=\"zh_TW\">以超級使用者(SuperUser)身份執行 `woeusb`</description>\n"
+        "		<description xml:lang=\"pl_PL\">Uruchom `woeusb` jako root</description>\n"
+        "\n"
+        "		<message>Authentication is required to run `woeusb` as SuperUser.</message>\n"
+        "		<message xml:lang=\"zh_TW\">以超級使用者(SuperUser)身份執行 `woeusb` 需要通過身份驗證。</message>\n"
+        "		<message xml:lang=\"pl_PL\">Wymagana jest autoryzacja do uruchomienia `woeusb` jako root</message>\n"
+        "\n"
+        "		<defaults>\n"
+        "			<allow_any>auth_admin</allow_any>\n"
+        "			<allow_inactive>auth_admin</allow_inactive>\n"
+        "			<allow_active>auth_admin_keep</allow_active>\n"
+        "		</defaults>\n"
+        "\n"
+        "		<annotate key=\"org.freedesktop.policykit.exec.path\">/usr/local/bin/woeusbgui</annotate>\n"
+        "   		<annotate key=\"org.freedesktop.policykit.exec.allow_gui\">true</annotate>\n"
+        "	</action>\n"
+        "</policyconfig>"
+    )
+    for action in dom.getElementsByTagName('action'):
+        if action.getAttribute('id') == "com.github.slacka.woeusb.run-gui-using-pkexec":
+            for annotate in action.getElementsByTagName('annotate'):
+                if annotate.getAttribute('key') == "org.freedesktop.policykit.exec.path":
+                    annotate.childNodes[0].nodeValue = path
+
+    with open("/usr/share/polkit-1/actions/com.github.woeusb.woeusb-ng.policy", "w") as file:
+        file.write(dom.toxml())
